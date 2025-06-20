@@ -39,13 +39,26 @@ def getMyPosition2(prcSoFar):
                 mean = (prcSoFar[i] - prcSoFar[j]).mean()
                 std = np.sqrt((prcSoFar[i] - prcSoFar[j]).var())
                 strong_pairs.append((i,j, mean, std))
-    trade_stocks = list()
+
     for stock1, stock2, mean, std in strong_pairs:
         price1 = prcSoFar[:-1, stock1]
         price2 = prcSoFar[:-1, stock2]
 
         z = (price1 - price2)/std
+        stock_value = priceFromZscore(z)
+        if z > 1:
+            currentPos[stock1] -= stock_value / price1
+            currentPos[stock2] += stock_value / price2
+        elif z < -1:
+            currentPos[stock1] += stock_value / price1
+            currentPos[stock2] -= stock_value / price2
+    return currentPos
 
-    
 
+def priceFromZscore(z):
+    if abs(z) < 1:
+        return 0
+    if abs(z) > 3:
+        return 8500
     
+    return 129 * np.exp(np.log(15)*0.5*z)+500
