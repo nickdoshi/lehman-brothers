@@ -1,15 +1,29 @@
 
 import numpy as np
 
-from helper import find_cointegrated_pairs as getStockPairs 
+
 import json
 
 ##### TODO #########################################
 ### IMPLEMENT 'getMyPosition' FUNCTION #############
 ### TO RUN, RUN 'eval.py' ##########################
 
+# === GLOBAL STATE === 
 nInst = 50
 currentPos = np.zeros(nInst)
+pairs = []
+active_trades = []
+closed_trades = []
+
+# === PARAMETERS ===
+COINT_PVAL_THRESH = 0.001
+ADF_PVAL_THRESH = 0.001
+EXPOSURE_LIMIT = 1e6
+BASE_CAP = 500
+MAX_CAP = 3000
+
+# === UTILITY FUNCTIONS ===
+from helper import find_cointegrated_pairs, priceFromZscore, estimate_half_life 
 
 # Momentum - based strategy 
 def getMyPosition(prcSoFar):
@@ -67,68 +81,80 @@ def getMyPosition2(prcSoFar):
     return currentPos
 
 
-def priceFromZscore(z):
-
-    # Points (1,500) and (3, 4500)
-    # y = A e^Bx + 300
-    B = np.log(11) / 2
-    A = 200 / (np.exp(B))
-    if z < 2:
-        return 0
-    if z > 3:
-        return 2000
-    # Expo: 
-    return A * np.exp(B * abs(z)) + 300 
-
 # Model 2: Co-integration + ADF test
 
-def getMyPosition3(prcSoFar, 
-                   lookback=200, 
-                   entry_z=1.0, 
-                   exit_z=0.5):
-    global currentPos, pairs
+def getMyPosition3(prcSoFar, lookback=120, entry_z_base=1.5, exit_z_multiplier=0.5):
+    global currentPos, pairs, active_trades, closed_trades
     (nins, nt) = prcSoFar.shape
-
-    # Ignore the first window width of days
-    if (nt < lookback): 
+    latest = prcSoFar[:, -1]
+    
+    if nt < lookback:
         return np.zeros(nins)
     
-    # Slide window every 25 time increments, more granular --> worst runtime
-    if (nt % 50 == 0):
-        pairs = getStockPairs(prcSoFar, lookback=lookback)
-
+    if nt % 25 == 0:
+        pairs = find_cointegrated_pairs(prcSoFar, lookback)
     
-    latest = prcSoFar[:, -1]               # shape (nInst,)
-    if (nt % 50 == 0):
-        print(f"checking day {nt}")
+    if not pairs:
+        return currentPos
 
-    for i, j, alpha, beta, mean_spread, std_spread in pairs:
+    baseline_std = np.median([p[5] for p in pairs if p[5] >= 1e-6]) or 1.0
+
+    # Check for new trades
+    for i, j, alpha, beta, mean_spread, std_spread, pval_adf in pairs[:5]:
         if std_spread < 1e-6:
             continue
 
-        # current spread
-        price_i = latest[i]
-        price_j = latest[j]
-        spread_now = price_i - (alpha + beta*price_j)
-        z = (spread_now - mean_spread)/std_spread
-        cap_per_pair = priceFromZscore(abs(z))
-        # entry / exit logic
-        if z > entry_z:
-            if (nt % 50 == 0):
-                print(f"found pos spread {z}")
-            # short the spread: i short, j long*β
-            currentPos[i] += int(-cap_per_pair / price_i)
-            currentPos[j] +=  int(cap_per_pair * beta / price_j)
-        elif z < -entry_z:
-            if (nt % 50 == 0):
-                print(f"found neg spread {z}")
-            # long the spread: i long, j short*β
-            currentPos[i] +=  int(cap_per_pair / price_i)
-            currentPos[j] += int(-cap_per_pair * beta / price_j)
-        elif abs(z) < exit_z:
-            currentPos[i] = 0
-            currentPos[j] = 0
-        # if |z| < exit_z, we do nothing (positions reset each call)
+        price_i, price_j = latest[i], latest[j]
+        spread_now = price_i - (alpha + beta * price_j)
+        z = (spread_now - mean_spread) / std_spread
+
+        entry_z = max(1.5, entry_z_base * (1 - pval_adf / ADF_PVAL_THRESH))
+        exit_z = entry_z * exit_z_multiplier
+        cap_per_stock = priceFromZscore(abs(z), pval_adf, entry_z)
+
+        if (i, j) not in active_trades:
+            if z > entry_z and z < 4:
+                # short spread
+                pos_i = int(-cap_per_stock * (std_spread / baseline_std) / price_i)
+                pos_j = int(cap_per_stock * (std_spread / baseline_std) * beta / price_j)
+                currentPos[i] += pos_i
+                currentPos[j] += pos_j
+                active_trades.append(dict(i=i, j=j,
+                                             direction='short', pos_i=pos_i, pos_j=pos_j,
+                                             price_i=price_i, price_j=price_j,
+                                             mean=mean_spread, std=std_spread, alpha=alpha, beta=beta)
+                                             )
+            elif z < -entry_z and z > -4:
+                # long spread
+                pos_i = int(cap_per_stock * (std_spread / baseline_std) / price_i)
+                pos_j = int(-cap_per_stock * (std_spread / baseline_std) * beta / price_j)
+                currentPos[i] += pos_i
+                currentPos[j] += pos_j
+                active_trades.append(dict(i=i, j=j,
+                                             direction='long', pos_i=pos_i, pos_j=pos_j,
+                                             price_i=price_i, price_j=price_j,
+                                             mean=mean_spread, std=std_spread, alpha=alpha, beta=beta)
+                                             )
+
+    # Exit logic
+    for idx, trade in enumerate(active_trades):
+
+        price_i, price_j = latest[trade['i']], latest[trade['j']]
+        spread_now = price_i - (trade['alpha'] + trade['beta'] * price_j)
+        z = (spread_now - trade['mean']) / trade['std']
+
+        profit = (price_i - trade['price_i']) * trade['pos_i'] + (price_j - trade['price_j']) * trade['pos_j']
+        exposure = abs(trade['pos_i'] * trade['price_i']) + abs(trade['pos_j'] * trade['price_j'])
+        profit_pct = profit / exposure if exposure > 0 else 0
+
+        if abs(z) < exit_z or profit_pct < -0.1:
+            currentPos[trade['i']] -= trade['pos_i']
+            currentPos[trade['j']] -= trade['pos_j']
+            closed_trades.append(trade)
+            active_trades.pop(idx)
+            print(f"Closed ({trade['i']},{trade['j']}) z={z:.2f} profit={profit:.2f} pct={profit_pct:.2%}")
+
     if (nt % 50 == 0):
-        print(currentPos)
+        print(len(active_trades))
+        print(len(closed_trades))
     return currentPos
